@@ -1,5 +1,5 @@
 cat > .github/workflows/eclipse-milo-cyclonedx-sbom.yaml <<'EOF'
-name: Eclipse Milo CycloneDX SBOM
+name: Eclipse_Milio_SBOM_CLEAR
 
 on:
   workflow_dispatch:
