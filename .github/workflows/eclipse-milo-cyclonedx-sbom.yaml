@@ -17,7 +17,7 @@ env:
 
 jobs:
   cyclonedx-sbom:
-    name: Build, generate and validate CycloneDX SBOMs
+    name: Build, generate, validate and assess CycloneDX SBOMs
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -70,7 +70,7 @@ jobs:
 
       - name: Install Syft for artifact SBOM generation
         run: |
-          mkdir -p "$SBOM_DIR/source" "$SBOM_DIR/artifacts" build-logs/milo validation-results/milo
+          mkdir -p "$SBOM_DIR/source" "$SBOM_DIR/artifacts" build-logs/milo validation-results/milo quality-results/milo
 
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
           syft version
@@ -87,6 +87,20 @@ jobs:
           sudo mv tools/cyclonedx /usr/local/bin/cyclonedx
 
           cyclonedx --version
+
+      - name: Install sbomqs for SBOM quality assessment
+        run: |
+          mkdir -p tools quality-results/milo
+
+          curl -L \
+            https://github.com/interlynk-io/sbomqs/releases/download/v1.0.2/sbomqs-linux-amd64.tar.gz \
+            -o tools/sbomqs-linux-amd64.tar.gz
+
+          tar -xzf tools/sbomqs-linux-amd64.tar.gz -C tools
+          chmod +x tools/sbomqs
+          sudo mv tools/sbomqs /usr/local/bin/sbomqs
+
+          sbomqs version || true
 
       - name: Generate source CycloneDX SBOM before build with cyclonedx-maven-plugin
         run: |
@@ -117,6 +131,16 @@ jobs:
             --input-format json \
             --input-version v1_6 \
             2>&1 | tee validation-results/milo/source-cyclonedx-validation.log
+
+      - name: Assess source CycloneDX SBOM quality with sbomqs
+        run: |
+          mkdir -p quality-results/milo
+
+          sbomqs score "$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" \
+            2>&1 | tee quality-results/milo/source-sbomqs-score.txt
+
+          sbomqs score "$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" --json \
+            > quality-results/milo/source-sbomqs-score.json || true
 
       - name: Build Eclipse Milo
         run: |
@@ -180,6 +204,20 @@ jobs:
             echo "Artifact SBOM not found. Skipping artifact SBOM validation." | tee validation-results/milo/artifact-cyclonedx-validation.log
           fi
 
+      - name: Assess artifact CycloneDX SBOM quality with sbomqs
+        run: |
+          mkdir -p quality-results/milo
+
+          if [ -f "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" ]; then
+            sbomqs score "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
+              2>&1 | tee quality-results/milo/artifact-sbomqs-score.txt
+
+            sbomqs score "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" --json \
+              > quality-results/milo/artifact-sbomqs-score.json || true
+          else
+            echo "Artifact SBOM not found. Skipping artifact SBOM quality assessment." | tee quality-results/milo/artifact-sbomqs-score.txt
+          fi
+
       - name: Generate summary
         if: always()
         run: |
@@ -195,7 +233,7 @@ jobs:
             echo
             echo "## Lifecycle stage"
             echo
-            echo "Current milestone: source SBOM before build + Maven build + artifact SBOM after build + CycloneDX schema validation"
+            echo "Current milestone: source SBOM before build + Maven build + artifact SBOM after build + schema validation + quality assessment"
             echo
             echo "## Tooling"
             echo
@@ -203,6 +241,7 @@ jobs:
             echo "- Source SBOM generation: CycloneDX Maven Plugin"
             echo "- Artifact SBOM generation: Syft"
             echo "- SBOM schema validation: CycloneDX CLI"
+            echo "- SBOM quality assessment: sbomqs"
             echo "- SBOM standard: CycloneDX"
             echo "- SBOM schema version: 1.6"
             echo "- Output format: JSON"
@@ -240,6 +279,17 @@ jobs:
               echo "- No validation results generated"
             fi
             echo
+            echo "## Quality results"
+            echo
+            if [ -d quality-results/milo ]; then
+              find quality-results/milo -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No quality results generated"
+            fi
+            echo
             echo "## Collected build artifacts"
             echo
             if [ -f build-logs/milo/collected-artifacts.txt ]; then
@@ -260,4 +310,5 @@ jobs:
             sbom/milo/
             build-logs/milo/
             validation-results/milo/
+            quality-results/milo/
             sbom-input-milo/
