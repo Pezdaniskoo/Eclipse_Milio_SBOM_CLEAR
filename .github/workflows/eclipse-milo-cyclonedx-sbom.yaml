@@ -10,14 +10,23 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: eclipse-milo-cyclonedx-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   PROJECT_DIR: source
   SBOM_DIR: sbom/milo
   ARTIFACT_INPUT_DIR: sbom-input-milo
+  VALIDATION_DIR: validation-results/milo
+  QUALITY_DIR: quality-results/milo
+  VULN_DIR: vulnerability-results/milo
+  VEX_DIR: vex/milo
+  BUILD_LOG_DIR: build-logs/milo
 
 jobs:
   cyclonedx-sbom:
-    name: Build, generate, validate and assess CycloneDX SBOMs
+    name: Build, generate, validate, scan and VEX CycloneDX SBOMs
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -56,12 +65,12 @@ jobs:
           cache: maven
           cache-dependency-path: source/**/pom.xml
 
-      - name: Set up Go for sbomqs
+      - name: Set up Go for sbomqs and vexctl
         uses: actions/setup-go@v5
         with:
           go-version: "1.22"
 
-      - name: Install tools
+      - name: Install base tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq unzip zip make rsync curl
@@ -76,16 +85,28 @@ jobs:
           echo "Go:"
           go version
 
+          mkdir -p \
+            "$SBOM_DIR/source" \
+            "$SBOM_DIR/artifacts" \
+            "$BUILD_LOG_DIR" \
+            "$VALIDATION_DIR" \
+            "$QUALITY_DIR" \
+            "$VULN_DIR" \
+            "$VEX_DIR"
+
       - name: Install Syft for artifact SBOM generation
         run: |
-          mkdir -p "$SBOM_DIR/source" "$SBOM_DIR/artifacts" build-logs/milo validation-results/milo quality-results/milo
-
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
-          syft version
+          syft version | tee "$BUILD_LOG_DIR/syft-version.txt"
+
+      - name: Install Grype for vulnerability analysis
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          grype version | tee "$BUILD_LOG_DIR/grype-version.txt"
 
       - name: Install CycloneDX CLI for SBOM schema validation
         run: |
-          mkdir -p tools validation-results/milo
+          mkdir -p tools
 
           curl -L \
             https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.29.1/cyclonedx-linux-x64 \
@@ -94,21 +115,25 @@ jobs:
           chmod +x tools/cyclonedx
           sudo mv tools/cyclonedx /usr/local/bin/cyclonedx
 
-          cyclonedx --version
+          cyclonedx --version | tee "$BUILD_LOG_DIR/cyclonedx-cli-version.txt"
 
       - name: Install sbomqs for SBOM quality assessment
         run: |
-          mkdir -p quality-results/milo
-
           go install github.com/interlynk-io/sbomqs@latest
-
           sudo cp "$HOME/go/bin/sbomqs" /usr/local/bin/sbomqs
 
           sbomqs version || sbomqs --version || true
 
+      - name: Install vexctl for OpenVEX processing
+        run: |
+          go install github.com/openvex/vexctl@latest
+          sudo cp "$HOME/go/bin/vexctl" /usr/local/bin/vexctl
+
+          vexctl version || vexctl --version || true
+
       - name: Generate source CycloneDX SBOM before build with cyclonedx-maven-plugin
         run: |
-          mkdir -p "$SBOM_DIR/source" build-logs/milo
+          mkdir -p "$SBOM_DIR/source" "$BUILD_LOG_DIR"
 
           cd "$PROJECT_DIR"
 
@@ -124,42 +149,42 @@ jobs:
             -DincludeSystemScope=true \
             -DincludeTestScope=true \
             -DincludeOptional=true \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-logs/milo/source-cyclonedx-generation.log"
+            2>&1 | tee "$GITHUB_WORKSPACE/$BUILD_LOG_DIR/source-cyclonedx-generation.log"
 
       - name: Validate source CycloneDX SBOM schema
         run: |
-          mkdir -p validation-results/milo
+          mkdir -p "$VALIDATION_DIR"
 
           cyclonedx validate \
             --input-file "$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" \
             --input-format json \
             --input-version v1_6 \
-            2>&1 | tee validation-results/milo/source-cyclonedx-validation.log
+            2>&1 | tee "$VALIDATION_DIR/source-cyclonedx-validation.log"
 
       - name: Assess source CycloneDX SBOM quality with sbomqs
         run: |
-          mkdir -p quality-results/milo
+          mkdir -p "$QUALITY_DIR"
 
           sbomqs score "$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" \
-            2>&1 | tee quality-results/milo/source-sbomqs-score.txt
+            2>&1 | tee "$QUALITY_DIR/source-sbomqs-score.txt"
 
           sbomqs score "$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" --json \
-            > quality-results/milo/source-sbomqs-score.json || true
+            > "$QUALITY_DIR/source-sbomqs-score.json" || true
 
       - name: Build Eclipse Milo
         run: |
-          mkdir -p build-logs/milo
+          mkdir -p "$BUILD_LOG_DIR"
 
           cd "$PROJECT_DIR"
 
           mvn -B -ntp -DskipTests package \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-logs/milo/maven-build.log"
+            2>&1 | tee "$GITHUB_WORKSPACE/$BUILD_LOG_DIR/maven-build.log"
 
       - name: Collect build artifacts after build
         if: always()
         run: |
           rm -rf "$ARTIFACT_INPUT_DIR"
-          mkdir -p "$ARTIFACT_INPUT_DIR" build-logs/milo
+          mkdir -p "$ARTIFACT_INPUT_DIR" "$BUILD_LOG_DIR"
 
           echo "Collecting JVM artifacts..."
           find "$PROJECT_DIR" -type f \( \
@@ -174,7 +199,7 @@ jobs:
 
           echo
           echo "Collected artifacts:"
-          find "$ARTIFACT_INPUT_DIR" -type f | sort | tee build-logs/milo/collected-artifacts.txt
+          find "$ARTIFACT_INPUT_DIR" -type f | sort | tee "$BUILD_LOG_DIR/collected-artifacts.txt"
 
           echo
           echo "Collected artifact count:"
@@ -182,47 +207,271 @@ jobs:
 
       - name: Generate artifact CycloneDX SBOM after build with Syft
         run: |
-          mkdir -p "$SBOM_DIR/artifacts" build-logs/milo
+          mkdir -p "$SBOM_DIR/artifacts" "$BUILD_LOG_DIR"
 
           if [ "$(find "$ARTIFACT_INPUT_DIR" -type f | wc -l)" -gt 0 ]; then
             syft dir:"$ARTIFACT_INPUT_DIR" \
               --source-name Eclipse-Milo-Build-Artifacts \
               --source-version "$GITHUB_SHA" \
               -o cyclonedx-json="$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
-              2>&1 | tee build-logs/milo/artifact-cyclonedx-generation.log
+              2>&1 | tee "$BUILD_LOG_DIR/artifact-cyclonedx-generation.log"
           else
-            echo "No build artifacts found. Skipping artifact CycloneDX SBOM generation." | tee build-logs/milo/artifact-cyclonedx-generation.log
+            echo "No build artifacts found. Skipping artifact CycloneDX SBOM generation." | tee "$BUILD_LOG_DIR/artifact-cyclonedx-generation.log"
           fi
 
       - name: Validate artifact CycloneDX SBOM schema
         run: |
-          mkdir -p validation-results/milo
+          mkdir -p "$VALIDATION_DIR"
 
           if [ -f "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" ]; then
             cyclonedx validate \
               --input-file "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
               --input-format json \
               --input-version v1_6 \
-              2>&1 | tee validation-results/milo/artifact-cyclonedx-validation.log
+              2>&1 | tee "$VALIDATION_DIR/artifact-cyclonedx-validation.log"
           else
-            echo "Artifact SBOM not found. Skipping artifact SBOM validation." | tee validation-results/milo/artifact-cyclonedx-validation.log
+            echo "Artifact SBOM not found. Skipping artifact SBOM validation." | tee "$VALIDATION_DIR/artifact-cyclonedx-validation.log"
           fi
 
       - name: Assess artifact CycloneDX SBOM quality with sbomqs
         run: |
-          mkdir -p quality-results/milo
+          mkdir -p "$QUALITY_DIR"
 
           if [ -f "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" ]; then
             sbomqs score "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
-              2>&1 | tee quality-results/milo/artifact-sbomqs-score.txt
+              2>&1 | tee "$QUALITY_DIR/artifact-sbomqs-score.txt"
 
             sbomqs score "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" --json \
-              > quality-results/milo/artifact-sbomqs-score.json || true
+              > "$QUALITY_DIR/artifact-sbomqs-score.json" || true
           else
-            echo "Artifact SBOM not found. Skipping artifact SBOM quality assessment." | tee quality-results/milo/artifact-sbomqs-score.txt
+            echo "Artifact SBOM not found. Skipping artifact SBOM quality assessment." | tee "$QUALITY_DIR/artifact-sbomqs-score.txt"
           fi
 
-      - name: Generate summary
+      - name: Perform vulnerability analysis on source SBOM with Grype
+        run: |
+          mkdir -p "$VULN_DIR"
+
+          grype "sbom:$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" \
+            -o json \
+            > "$VULN_DIR/source-grype.json" || true
+
+          grype "sbom:$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" \
+            -o table \
+            2>&1 | tee "$VULN_DIR/source-grype.table.txt" || true
+
+      - name: Perform vulnerability analysis on artifact SBOM with Grype
+        run: |
+          mkdir -p "$VULN_DIR"
+
+          if [ -f "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" ]; then
+            grype "sbom:$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
+              -o json \
+              > "$VULN_DIR/artifact-grype.json" || true
+
+            grype "sbom:$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
+              -o table \
+              2>&1 | tee "$VULN_DIR/artifact-grype.table.txt" || true
+          else
+            echo "Artifact SBOM not found. Skipping artifact vulnerability analysis." | tee "$VULN_DIR/artifact-grype.table.txt"
+            echo '{"matches":[]}' > "$VULN_DIR/artifact-grype.json"
+          fi
+
+      - name: Generate vulnerability summary
+        if: always()
+        run: |
+          mkdir -p "$VULN_DIR"
+
+          SOURCE_TOTAL=$(jq '.matches | length' "$VULN_DIR/source-grype.json" 2>/dev/null || echo 0)
+          ARTIFACT_TOTAL=$(jq '.matches | length' "$VULN_DIR/artifact-grype.json" 2>/dev/null || echo 0)
+
+          {
+            echo "# Eclipse Milo vulnerability analysis summary"
+            echo
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Source SBOM: \`$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json\`"
+            echo "Artifact SBOM: \`$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json\`"
+            echo
+            echo "## Vulnerability counts"
+            echo
+            echo "- Source SBOM findings: $SOURCE_TOTAL"
+            echo "- Artifact SBOM findings: $ARTIFACT_TOTAL"
+            echo
+            echo "## Top source SBOM findings"
+            echo
+            jq -r '
+              .matches[0:20][]? |
+              "- " + .vulnerability.id +
+              " | " + (.vulnerability.severity // "unknown") +
+              " | " + (.artifact.name // "unknown") +
+              " " + (.artifact.version // "")
+            ' "$VULN_DIR/source-grype.json" 2>/dev/null || echo "- No source findings"
+            echo
+            echo "## Top artifact SBOM findings"
+            echo
+            jq -r '
+              .matches[0:20][]? |
+              "- " + .vulnerability.id +
+              " | " + (.vulnerability.severity // "unknown") +
+              " | " + (.artifact.name // "unknown") +
+              " " + (.artifact.version // "")
+            ' "$VULN_DIR/artifact-grype.json" 2>/dev/null || echo "- No artifact findings"
+          } > "$VULN_DIR/vulnerability-summary.md"
+
+          cat "$VULN_DIR/vulnerability-summary.md"
+
+      - name: Upload artifact SBOM to Dependency-Track if configured
+        if: always()
+        env:
+          DTRACK_BASE_URL: ${{ secrets.DTRACK_BASE_URL }}
+          DTRACK_API_KEY: ${{ secrets.DTRACK_API_KEY }}
+          DTRACK_PROJECT_UUID: ${{ secrets.DTRACK_PROJECT_UUID }}
+        run: |
+          mkdir -p dependency-track-results/milo
+
+          if [ -z "$DTRACK_BASE_URL" ] || [ -z "$DTRACK_API_KEY" ] || [ -z "$DTRACK_PROJECT_UUID" ]; then
+            echo "Dependency-Track secrets are not configured. Skipping upload." | tee dependency-track-results/milo/dependency-track-upload.log
+            echo "Required secrets: DTRACK_BASE_URL, DTRACK_API_KEY, DTRACK_PROJECT_UUID" | tee -a dependency-track-results/milo/dependency-track-upload.log
+            exit 0
+          fi
+
+          if [ ! -f "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" ]; then
+            echo "Artifact SBOM not found. Skipping Dependency-Track upload." | tee dependency-track-results/milo/dependency-track-upload.log
+            exit 0
+          fi
+
+          echo "Uploading artifact SBOM to Dependency-Track..." | tee dependency-track-results/milo/dependency-track-upload.log
+
+          HTTP_CODE=$(curl -sS -o dependency-track-results/milo/dependency-track-response.json -w "%{http_code}" \
+            -X POST "$DTRACK_BASE_URL/api/v1/bom" \
+            -H "X-Api-Key: $DTRACK_API_KEY" \
+            -F "project=$DTRACK_PROJECT_UUID" \
+            -F "bom=@$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json")
+
+          echo "Dependency-Track HTTP status: $HTTP_CODE" | tee -a dependency-track-results/milo/dependency-track-upload.log
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Dependency-Track upload completed successfully." | tee -a dependency-track-results/milo/dependency-track-upload.log
+          else
+            echo "Dependency-Track upload failed or was not accepted." | tee -a dependency-track-results/milo/dependency-track-upload.log
+            cat dependency-track-results/milo/dependency-track-response.json || true
+          fi
+
+      - name: Produce OpenVEX document from vulnerability analysis
+        if: always()
+        run: |
+          mkdir -p "$VEX_DIR"
+
+          PRODUCT_ID="pkg:generic/eclipse-milo@${GITHUB_SHA}"
+
+          jq -n \
+            --arg id "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/openvex/eclipse-milo" \
+            --arg author "GitHub Actions" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg product "$PRODUCT_ID" \
+            --slurpfile src "$VULN_DIR/source-grype.json" \
+            --slurpfile art "$VULN_DIR/artifact-grype.json" '
+            {
+              "@context": "https://openvex.dev/ns/v0.2.0",
+              "@id": $id,
+              "author": $author,
+              "timestamp": $timestamp,
+              "version": 1,
+              "statements": (
+                (
+                  (($src[0].matches // []) + ($art[0].matches // []))
+                  | map(.vulnerability.id)
+                  | unique
+                  | .[0:50]
+                  | map({
+                      "vulnerability": {"name": .},
+                      "products": [{"@id": $product}],
+                      "status": "under_investigation",
+                      "impact_statement": "Automatically generated OpenVEX placeholder from Grype findings. Vulnerability requires manual exploitability assessment before affected/not_affected status can be assigned."
+                    })
+                )
+              )
+            }' > "$VEX_DIR/eclipse-milo.openvex.json"
+
+          echo "# Eclipse Milo OpenVEX summary" > "$VEX_DIR/vex-summary.md"
+          echo >> "$VEX_DIR/vex-summary.md"
+          echo "OpenVEX file: \`$VEX_DIR/eclipse-milo.openvex.json\`" >> "$VEX_DIR/vex-summary.md"
+          echo >> "$VEX_DIR/vex-summary.md"
+          echo "Generated statements:" >> "$VEX_DIR/vex-summary.md"
+          jq '.statements | length' "$VEX_DIR/eclipse-milo.openvex.json" >> "$VEX_DIR/vex-summary.md"
+          echo >> "$VEX_DIR/vex-summary.md"
+          echo "Default status: \`under_investigation\`" >> "$VEX_DIR/vex-summary.md"
+          echo >> "$VEX_DIR/vex-summary.md"
+          echo "Reason: automatic pipeline cannot honestly mark findings as affected or not_affected without manual exploitability analysis." >> "$VEX_DIR/vex-summary.md"
+
+          cat "$VEX_DIR/vex-summary.md"
+
+      - name: Validate OpenVEX document with vexctl
+        if: always()
+        run: |
+          mkdir -p "$VEX_DIR"
+
+          if command -v vexctl >/dev/null 2>&1; then
+            vexctl validate "$VEX_DIR/eclipse-milo.openvex.json" \
+              2>&1 | tee "$VEX_DIR/vexctl-validation.log" || true
+          else
+            echo "vexctl not available. Skipping OpenVEX validation." | tee "$VEX_DIR/vexctl-validation.log"
+          fi
+
+      - name: Generate traceability manifest
+        if: always()
+        run: |
+          mkdir -p "$SBOM_DIR"
+
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg ref "$GITHUB_REF" \
+            --arg commit "$GITHUB_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg project_dir "$PROJECT_DIR" \
+            --arg source_sbom "$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" \
+            --arg artifact_sbom "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
+            --arg source_validation "$VALIDATION_DIR/source-cyclonedx-validation.log" \
+            --arg artifact_validation "$VALIDATION_DIR/artifact-cyclonedx-validation.log" \
+            --arg source_quality "$QUALITY_DIR/source-sbomqs-score.txt" \
+            --arg artifact_quality "$QUALITY_DIR/artifact-sbomqs-score.txt" \
+            --arg source_vuln "$VULN_DIR/source-grype.json" \
+            --arg artifact_vuln "$VULN_DIR/artifact-grype.json" \
+            --arg vex "$VEX_DIR/eclipse-milo.openvex.json" \
+            '{
+              repository: $repository,
+              ref: $ref,
+              commit: $commit,
+              workflow_run_id: $run_id,
+              workflow_run_attempt: $run_attempt,
+              project_directory: $project_dir,
+              lifecycle: {
+                build: "Maven package",
+                source_sbom_generation: "CycloneDX Maven Plugin",
+                artifact_sbom_generation: "Syft",
+                schema_validation: "CycloneDX CLI",
+                quality_assessment: "sbomqs",
+                vulnerability_analysis: "Grype",
+                tracking: "Dependency-Track optional upload",
+                vex: "OpenVEX generated from Grype findings"
+              },
+              artifacts: {
+                source_sbom: $source_sbom,
+                artifact_sbom: $artifact_sbom,
+                source_validation: $source_validation,
+                artifact_validation: $artifact_validation,
+                source_quality: $source_quality,
+                artifact_quality: $artifact_quality,
+                source_vulnerability_results: $source_vuln,
+                artifact_vulnerability_results: $artifact_vuln,
+                vex: $vex
+              }
+            }' > "$SBOM_DIR/manifest.json"
+
+          cat "$SBOM_DIR/manifest.json"
+
+      - name: Generate final summary
         if: always()
         run: |
           mkdir -p "$SBOM_DIR"
@@ -237,7 +486,7 @@ jobs:
             echo
             echo "## Lifecycle stage"
             echo
-            echo "Current milestone: source SBOM before build + Maven build + artifact SBOM after build + schema validation + quality assessment"
+            echo "Current milestone: source SBOM + artifact SBOM + schema validation + quality assessment + artifact storage + vulnerability analysis + Dependency-Track optional upload + OpenVEX generation"
             echo
             echo "## Tooling"
             echo
@@ -246,12 +495,15 @@ jobs:
             echo "- Artifact SBOM generation: Syft"
             echo "- SBOM schema validation: CycloneDX CLI"
             echo "- SBOM quality assessment: sbomqs"
+            echo "- Artifact storage: actions/upload-artifact@v4"
+            echo "- Vulnerability analysis: Grype"
+            echo "- Store, scan and track: Dependency-Track optional upload"
+            echo "- VEX: OpenVEX generated and validated with vexctl where available"
             echo "- SBOM standard: CycloneDX"
             echo "- SBOM schema version: 1.6"
             echo "- Output format: JSON"
             echo
             echo "## Generated source SBOM files"
-            echo
             if [ -d "$SBOM_DIR/source" ]; then
               find "$SBOM_DIR/source" -type f | sort | while read file; do
                 size=$(wc -c < "$file")
@@ -262,7 +514,6 @@ jobs:
             fi
             echo
             echo "## Generated artifact SBOM files"
-            echo
             if [ -d "$SBOM_DIR/artifacts" ]; then
               find "$SBOM_DIR/artifacts" -type f | sort | while read file; do
                 size=$(wc -c < "$file")
@@ -273,9 +524,8 @@ jobs:
             fi
             echo
             echo "## Validation results"
-            echo
-            if [ -d validation-results/milo ]; then
-              find validation-results/milo -type f | sort | while read file; do
+            if [ -d "$VALIDATION_DIR" ]; then
+              find "$VALIDATION_DIR" -type f | sort | while read file; do
                 size=$(wc -c < "$file")
                 echo "- \`$file\` (${size} bytes)"
               done
@@ -284,9 +534,8 @@ jobs:
             fi
             echo
             echo "## Quality results"
-            echo
-            if [ -d quality-results/milo ]; then
-              find quality-results/milo -type f | sort | while read file; do
+            if [ -d "$QUALITY_DIR" ]; then
+              find "$QUALITY_DIR" -type f | sort | while read file; do
                 size=$(wc -c < "$file")
                 echo "- \`$file\` (${size} bytes)"
               done
@@ -294,10 +543,29 @@ jobs:
               echo "- No quality results generated"
             fi
             echo
-            echo "## Collected build artifacts"
+            echo "## Vulnerability results"
+            if [ -d "$VULN_DIR" ]; then
+              find "$VULN_DIR" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No vulnerability results generated"
+            fi
             echo
-            if [ -f build-logs/milo/collected-artifacts.txt ]; then
-              echo "- Count: $(wc -l < build-logs/milo/collected-artifacts.txt)"
+            echo "## VEX results"
+            if [ -d "$VEX_DIR" ]; then
+              find "$VEX_DIR" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No VEX results generated"
+            fi
+            echo
+            echo "## Collected build artifacts"
+            if [ -f "$BUILD_LOG_DIR/collected-artifacts.txt" ]; then
+              echo "- Count: $(wc -l < "$BUILD_LOG_DIR/collected-artifacts.txt")"
             else
               echo "- Count: unavailable"
             fi
@@ -305,14 +573,17 @@ jobs:
 
           cat "$SBOM_DIR/summary.md"
 
-      - name: Upload CycloneDX SBOM results
+      - name: Upload full CycloneDX SBOM lifecycle results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: eclipse-milo-cyclonedx-sbom-results
+          name: eclipse-milo-cyclonedx-sbom-lifecycle-results
           path: |
             sbom/milo/
             build-logs/milo/
             validation-results/milo/
             quality-results/milo/
+            vulnerability-results/milo/
+            dependency-track-results/milo/
+            vex/milo/
             sbom-input-milo/
