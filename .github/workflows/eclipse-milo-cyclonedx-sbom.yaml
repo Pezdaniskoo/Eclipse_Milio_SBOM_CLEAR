@@ -1,4 +1,3 @@
-cat > .github/workflows/eclipse-milo-cyclonedx-sbom.yaml <<'EOF'
 name: Eclipse_Milio_SBOM_CLEAR
 
 on:
