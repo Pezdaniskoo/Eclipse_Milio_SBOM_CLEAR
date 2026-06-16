@@ -17,7 +17,7 @@ env:
 
 jobs:
   cyclonedx-sbom:
-    name: Build and generate CycloneDX SBOMs
+    name: Build, generate and validate CycloneDX SBOMs
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -59,7 +59,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq unzip zip make rsync
+          sudo apt-get install -y jq unzip zip make rsync curl
 
           echo "Java:"
           java -version
@@ -70,10 +70,23 @@ jobs:
 
       - name: Install Syft for artifact SBOM generation
         run: |
-          mkdir -p "$SBOM_DIR/source" "$SBOM_DIR/artifacts" build-logs/milo
+          mkdir -p "$SBOM_DIR/source" "$SBOM_DIR/artifacts" build-logs/milo validation-results/milo
 
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
           syft version
+
+      - name: Install CycloneDX CLI for SBOM schema validation
+        run: |
+          mkdir -p tools validation-results/milo
+
+          curl -L \
+            https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.29.1/cyclonedx-linux-x64 \
+            -o tools/cyclonedx
+
+          chmod +x tools/cyclonedx
+          sudo mv tools/cyclonedx /usr/local/bin/cyclonedx
+
+          cyclonedx --version
 
       - name: Generate source CycloneDX SBOM before build with cyclonedx-maven-plugin
         run: |
@@ -94,6 +107,16 @@ jobs:
             -DincludeTestScope=true \
             -DincludeOptional=true \
             2>&1 | tee "$GITHUB_WORKSPACE/build-logs/milo/source-cyclonedx-generation.log"
+
+      - name: Validate source CycloneDX SBOM schema
+        run: |
+          mkdir -p validation-results/milo
+
+          cyclonedx validate \
+            --input-file "$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" \
+            --input-format json \
+            --input-version v1_6 \
+            2>&1 | tee validation-results/milo/source-cyclonedx-validation.log
 
       - name: Build Eclipse Milo
         run: |
@@ -143,6 +166,20 @@ jobs:
             echo "No build artifacts found. Skipping artifact CycloneDX SBOM generation." | tee build-logs/milo/artifact-cyclonedx-generation.log
           fi
 
+      - name: Validate artifact CycloneDX SBOM schema
+        run: |
+          mkdir -p validation-results/milo
+
+          if [ -f "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" ]; then
+            cyclonedx validate \
+              --input-file "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
+              --input-format json \
+              --input-version v1_6 \
+              2>&1 | tee validation-results/milo/artifact-cyclonedx-validation.log
+          else
+            echo "Artifact SBOM not found. Skipping artifact SBOM validation." | tee validation-results/milo/artifact-cyclonedx-validation.log
+          fi
+
       - name: Generate summary
         if: always()
         run: |
@@ -158,15 +195,16 @@ jobs:
             echo
             echo "## Lifecycle stage"
             echo
-            echo "Current milestone: source SBOM before build + Maven build + artifact SBOM after build"
+            echo "Current milestone: source SBOM before build + Maven build + artifact SBOM after build + CycloneDX schema validation"
             echo
             echo "## Tooling"
             echo
             echo "- Build: Maven"
             echo "- Source SBOM generation: CycloneDX Maven Plugin"
             echo "- Artifact SBOM generation: Syft"
+            echo "- SBOM schema validation: CycloneDX CLI"
             echo "- SBOM standard: CycloneDX"
-            echo "- SBOM schema version: 1.6 for Maven plugin output"
+            echo "- SBOM schema version: 1.6"
             echo "- Output format: JSON"
             echo
             echo "## Generated source SBOM files"
@@ -191,6 +229,17 @@ jobs:
               echo "- No artifact SBOM files generated"
             fi
             echo
+            echo "## Validation results"
+            echo
+            if [ -d validation-results/milo ]; then
+              find validation-results/milo -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No validation results generated"
+            fi
+            echo
             echo "## Collected build artifacts"
             echo
             if [ -f build-logs/milo/collected-artifacts.txt ]; then
@@ -210,4 +259,5 @@ jobs:
           path: |
             sbom/milo/
             build-logs/milo/
+            validation-results/milo/
             sbom-input-milo/
