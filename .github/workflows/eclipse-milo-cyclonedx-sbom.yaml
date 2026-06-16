@@ -13,10 +13,11 @@ permissions:
 env:
   PROJECT_DIR: source
   SBOM_DIR: sbom/milo
+  ARTIFACT_INPUT_DIR: sbom-input-milo
 
 jobs:
   cyclonedx-sbom:
-    name: Build and generate CycloneDX SBOM
+    name: Build and generate CycloneDX SBOMs
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -55,6 +56,45 @@ jobs:
           cache: maven
           cache-dependency-path: source/**/pom.xml
 
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq unzip zip make rsync
+
+          echo "Java:"
+          java -version
+          javac -version
+
+          echo "Maven:"
+          mvn -version
+
+      - name: Install Syft for artifact SBOM generation
+        run: |
+          mkdir -p "$SBOM_DIR/source" "$SBOM_DIR/artifacts" build-logs/milo
+
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          syft version
+
+      - name: Generate source CycloneDX SBOM before build with cyclonedx-maven-plugin
+        run: |
+          mkdir -p "$SBOM_DIR/source" build-logs/milo
+
+          cd "$PROJECT_DIR"
+
+          mvn -B -ntp \
+            org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom \
+            -DschemaVersion=1.6 \
+            -DoutputFormat=json \
+            -DoutputName=eclipse-milo.source.cyclonedx \
+            -DoutputDirectory="$GITHUB_WORKSPACE/$SBOM_DIR/source" \
+            -DincludeCompileScope=true \
+            -DincludeProvidedScope=true \
+            -DincludeRuntimeScope=true \
+            -DincludeSystemScope=true \
+            -DincludeTestScope=true \
+            -DincludeOptional=true \
+            2>&1 | tee "$GITHUB_WORKSPACE/build-logs/milo/source-cyclonedx-generation.log"
+
       - name: Build Eclipse Milo
         run: |
           mkdir -p build-logs/milo
@@ -64,25 +104,11 @@ jobs:
           mvn -B -ntp -DskipTests package \
             2>&1 | tee "$GITHUB_WORKSPACE/build-logs/milo/maven-build.log"
 
-      - name: Generate CycloneDX SBOM with cyclonedx-maven-plugin
-        run: |
-          mkdir -p "$SBOM_DIR"
-
-          cd "$PROJECT_DIR"
-
-          mvn -B -ntp \
-            org.cyclonedx:cyclonedx-maven-plugin:2.9.1:makeAggregateBom \
-            -DschemaVersion=1.6 \
-            -DoutputFormat=json \
-            -DoutputName=eclipse-milo.cyclonedx \
-            -DoutputDirectory="$GITHUB_WORKSPACE/$SBOM_DIR" \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-logs/milo/cyclonedx-generation.log"
-
-      - name: Collect build artifacts
+      - name: Collect build artifacts after build
         if: always()
         run: |
-          rm -rf sbom-input-milo
-          mkdir -p sbom-input-milo build-logs/milo
+          rm -rf "$ARTIFACT_INPUT_DIR"
+          mkdir -p "$ARTIFACT_INPUT_DIR" build-logs/milo
 
           echo "Collecting JVM artifacts..."
           find "$PROJECT_DIR" -type f \( \
@@ -93,15 +119,29 @@ jobs:
             -not -path "*/node_modules/*" \
             -not -path "*/build/*" \
             -not -path "*/dist/*" \
-            -print -exec cp --parents {} sbom-input-milo/ \; || true
+            -print -exec cp --parents {} "$ARTIFACT_INPUT_DIR"/ \; || true
 
           echo
           echo "Collected artifacts:"
-          find sbom-input-milo -type f | sort | tee build-logs/milo/collected-artifacts.txt
+          find "$ARTIFACT_INPUT_DIR" -type f | sort | tee build-logs/milo/collected-artifacts.txt
 
           echo
           echo "Collected artifact count:"
-          find sbom-input-milo -type f | wc -l
+          find "$ARTIFACT_INPUT_DIR" -type f | wc -l
+
+      - name: Generate artifact CycloneDX SBOM after build with Syft
+        run: |
+          mkdir -p "$SBOM_DIR/artifacts" build-logs/milo
+
+          if [ "$(find "$ARTIFACT_INPUT_DIR" -type f | wc -l)" -gt 0 ]; then
+            syft dir:"$ARTIFACT_INPUT_DIR" \
+              --source-name Eclipse-Milo-Build-Artifacts \
+              --source-version "$GITHUB_SHA" \
+              -o cyclonedx-json="$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
+              2>&1 | tee build-logs/milo/artifact-cyclonedx-generation.log
+          else
+            echo "No build artifacts found. Skipping artifact CycloneDX SBOM generation." | tee build-logs/milo/artifact-cyclonedx-generation.log
+          fi
 
       - name: Generate summary
         if: always()
@@ -118,25 +158,37 @@ jobs:
             echo
             echo "## Lifecycle stage"
             echo
-            echo "Current milestone: build + CycloneDX SBOM generation"
+            echo "Current milestone: source SBOM before build + Maven build + artifact SBOM after build"
             echo
             echo "## Tooling"
             echo
             echo "- Build: Maven"
-            echo "- SBOM generation: cyclonedx-maven-plugin"
+            echo "- Source SBOM generation: CycloneDX Maven Plugin"
+            echo "- Artifact SBOM generation: Syft"
             echo "- SBOM standard: CycloneDX"
-            echo "- SBOM schema version: 1.6"
+            echo "- SBOM schema version: 1.6 for Maven plugin output"
             echo "- Output format: JSON"
             echo
-            echo "## Generated SBOM files"
+            echo "## Generated source SBOM files"
             echo
-            if [ -d "$SBOM_DIR" ]; then
-              find "$SBOM_DIR" -type f | sort | while read file; do
+            if [ -d "$SBOM_DIR/source" ]; then
+              find "$SBOM_DIR/source" -type f | sort | while read file; do
                 size=$(wc -c < "$file")
                 echo "- \`$file\` (${size} bytes)"
               done
             else
-              echo "- No SBOM files generated"
+              echo "- No source SBOM files generated"
+            fi
+            echo
+            echo "## Generated artifact SBOM files"
+            echo
+            if [ -d "$SBOM_DIR/artifacts" ]; then
+              find "$SBOM_DIR/artifacts" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No artifact SBOM files generated"
             fi
             echo
             echo "## Collected build artifacts"
