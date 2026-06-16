@@ -21,6 +21,7 @@ env:
   VALIDATION_DIR: validation-results/milo
   QUALITY_DIR: quality-results/milo
   VULN_DIR: vulnerability-results/milo
+  DTRACK_DIR: dependency-track-results/milo
   VEX_DIR: vex/milo
   BUILD_LOG_DIR: build-logs/milo
 
@@ -92,6 +93,7 @@ jobs:
             "$VALIDATION_DIR" \
             "$QUALITY_DIR" \
             "$VULN_DIR" \
+            "$DTRACK_DIR" \
             "$VEX_DIR"
 
       - name: Install Syft for artifact SBOM generation
@@ -124,7 +126,7 @@ jobs:
 
           sbomqs version || sbomqs --version || true
 
-      - name: Install vexctl for OpenVEX processing
+      - name: Install vexctl for OpenVEX tooling
         run: |
           go install github.com/openvex/vexctl@latest
           sudo cp "$HOME/go/bin/vexctl" /usr/local/bin/vexctl
@@ -298,7 +300,6 @@ jobs:
             echo "- Artifact SBOM findings: $ARTIFACT_TOTAL"
             echo
             echo "## Top source SBOM findings"
-            echo
             jq -r '
               .matches[0:20][]? |
               "- " + .vulnerability.id +
@@ -308,7 +309,6 @@ jobs:
             ' "$VULN_DIR/source-grype.json" 2>/dev/null || echo "- No source findings"
             echo
             echo "## Top artifact SBOM findings"
-            echo
             jq -r '
               .matches[0:20][]? |
               "- " + .vulnerability.id +
@@ -326,35 +326,61 @@ jobs:
           DTRACK_BASE_URL: ${{ secrets.DTRACK_BASE_URL }}
           DTRACK_API_KEY: ${{ secrets.DTRACK_API_KEY }}
           DTRACK_PROJECT_UUID: ${{ secrets.DTRACK_PROJECT_UUID }}
+          DTRACK_PROJECT_NAME: ${{ secrets.DTRACK_PROJECT_NAME }}
+          DTRACK_PROJECT_VERSION: ${{ secrets.DTRACK_PROJECT_VERSION }}
         run: |
-          mkdir -p dependency-track-results/milo
+          mkdir -p "$DTRACK_DIR"
 
-          if [ -z "$DTRACK_BASE_URL" ] || [ -z "$DTRACK_API_KEY" ] || [ -z "$DTRACK_PROJECT_UUID" ]; then
-            echo "Dependency-Track secrets are not configured. Skipping upload." | tee dependency-track-results/milo/dependency-track-upload.log
-            echo "Required secrets: DTRACK_BASE_URL, DTRACK_API_KEY, DTRACK_PROJECT_UUID" | tee -a dependency-track-results/milo/dependency-track-upload.log
+          SBOM_FILE="$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json"
+
+          if [ -z "$DTRACK_BASE_URL" ] || [ -z "$DTRACK_API_KEY" ]; then
+            echo "Dependency-Track base URL or API key is not configured. Skipping upload." | tee "$DTRACK_DIR/dependency-track-upload.log"
+            echo "Required secrets: DTRACK_BASE_URL, DTRACK_API_KEY." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            echo "Optional mode A: DTRACK_PROJECT_UUID." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            echo "Optional mode B: DTRACK_PROJECT_NAME, DTRACK_PROJECT_VERSION with autoCreate=true." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
             exit 0
           fi
 
-          if [ ! -f "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" ]; then
-            echo "Artifact SBOM not found. Skipping Dependency-Track upload." | tee dependency-track-results/milo/dependency-track-upload.log
+          if [ ! -f "$SBOM_FILE" ]; then
+            echo "Artifact SBOM not found. Skipping Dependency-Track upload." | tee "$DTRACK_DIR/dependency-track-upload.log"
             exit 0
           fi
 
-          echo "Uploading artifact SBOM to Dependency-Track..." | tee dependency-track-results/milo/dependency-track-upload.log
+          echo "Uploading artifact SBOM to Dependency-Track..." | tee "$DTRACK_DIR/dependency-track-upload.log"
 
-          HTTP_CODE=$(curl -sS -o dependency-track-results/milo/dependency-track-response.json -w "%{http_code}" \
-            -X POST "$DTRACK_BASE_URL/api/v1/bom" \
-            -H "X-Api-Key: $DTRACK_API_KEY" \
-            -F "project=$DTRACK_PROJECT_UUID" \
-            -F "bom=@$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json")
+          if [ -n "$DTRACK_PROJECT_UUID" ]; then
+            echo "Using Dependency-Track project UUID mode." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
 
-          echo "Dependency-Track HTTP status: $HTTP_CODE" | tee -a dependency-track-results/milo/dependency-track-upload.log
+            HTTP_CODE=$(curl -sS -o "$DTRACK_DIR/dependency-track-response.json" -w "%{http_code}" \
+              -X POST "$DTRACK_BASE_URL/api/v1/bom" \
+              -H "X-Api-Key: $DTRACK_API_KEY" \
+              -F "project=$DTRACK_PROJECT_UUID" \
+              -F "bom=@$SBOM_FILE")
+          else
+            PROJECT_NAME="${DTRACK_PROJECT_NAME:-Eclipse Milo}"
+            PROJECT_VERSION="${DTRACK_PROJECT_VERSION:-$GITHUB_SHA}"
+
+            echo "Using Dependency-Track autoCreate projectName/projectVersion mode." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            echo "Project name: $PROJECT_NAME" | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            echo "Project version: $PROJECT_VERSION" | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+
+            HTTP_CODE=$(curl -sS -o "$DTRACK_DIR/dependency-track-response.json" -w "%{http_code}" \
+              -X POST "$DTRACK_BASE_URL/api/v1/bom" \
+              -H "X-Api-Key: $DTRACK_API_KEY" \
+              -F "autoCreate=true" \
+              -F "projectName=$PROJECT_NAME" \
+              -F "projectVersion=$PROJECT_VERSION" \
+              -F "bom=@$SBOM_FILE")
+          fi
+
+          echo "Dependency-Track HTTP status: $HTTP_CODE" | tee -a "$DTRACK_DIR/dependency-track-upload.log"
 
           if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-            echo "Dependency-Track upload completed successfully." | tee -a dependency-track-results/milo/dependency-track-upload.log
+            echo "Dependency-Track upload completed successfully." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
           else
-            echo "Dependency-Track upload failed or was not accepted." | tee -a dependency-track-results/milo/dependency-track-upload.log
-            cat dependency-track-results/milo/dependency-track-response.json || true
+            echo "Dependency-Track upload failed or was not accepted." | tee -a "$DTRACK_DIR/dependency-track-upload.log"
+            cat "$DTRACK_DIR/dependency-track-response.json" || true
+            exit 0
           fi
 
       - name: Produce OpenVEX document from vulnerability analysis
@@ -363,11 +389,13 @@ jobs:
           mkdir -p "$VEX_DIR"
 
           PRODUCT_ID="pkg:generic/eclipse-milo@${GITHUB_SHA}"
+          VEX_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          VEX_ID="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/openvex/eclipse-milo"
 
           jq -n \
-            --arg id "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/openvex/eclipse-milo" \
+            --arg id "$VEX_ID" \
             --arg author "GitHub Actions" \
-            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg timestamp "$VEX_TIMESTAMP" \
             --arg product "$PRODUCT_ID" \
             --slurpfile src "$VULN_DIR/source-grype.json" \
             --slurpfile art "$VULN_DIR/artifact-grype.json" '
@@ -385,6 +413,7 @@ jobs:
                   | .[0:50]
                   | map({
                       "vulnerability": {"name": .},
+                      "timestamp": $timestamp,
                       "products": [{"@id": $product}],
                       "status": "under_investigation",
                       "impact_statement": "Automatically generated OpenVEX placeholder from Grype findings. Vulnerability requires manual exploitability assessment before affected/not_affected status can be assigned."
@@ -406,16 +435,48 @@ jobs:
 
           cat "$VEX_DIR/vex-summary.md"
 
-      - name: Validate OpenVEX document with vexctl
+      - name: Check OpenVEX document structure
         if: always()
         run: |
           mkdir -p "$VEX_DIR"
 
-          if command -v vexctl >/dev/null 2>&1; then
-            vexctl validate "$VEX_DIR/eclipse-milo.openvex.json" \
-              2>&1 | tee "$VEX_DIR/vexctl-validation.log" || true
+          VEX_FILE="$VEX_DIR/eclipse-milo.openvex.json"
+
+          jq -e '
+            .["@context"] == "https://openvex.dev/ns/v0.2.0"
+            and (.["@id"] | type == "string")
+            and (.author | type == "string")
+            and (.timestamp | type == "string")
+            and (.version | type == "number")
+            and (.statements | type == "array")
+            and all(.statements[]?;
+              (.vulnerability.name | type == "string")
+              and (.timestamp | type == "string")
+              and (.products | type == "array")
+              and (.status | IN("not_affected", "affected", "fixed", "under_investigation"))
+            )
+          ' "$VEX_FILE" \
+            2>&1 | tee "$VEX_DIR/openvex-structure-check.log"
+
+      - name: Generate VEX example with vexctl
+        if: always()
+        run: |
+          mkdir -p "$VEX_DIR"
+
+          FIRST_VULN=$(jq -r '
+            ((.matches // []) | map(.vulnerability.id) | unique | .[0]) // empty
+          ' "$VULN_DIR/artifact-grype.json" 2>/dev/null)
+
+          PRODUCT_ID="pkg:generic/eclipse-milo@${GITHUB_SHA}"
+
+          if [ -n "$FIRST_VULN" ]; then
+            vexctl create \
+              --product="$PRODUCT_ID" \
+              --vuln="$FIRST_VULN" \
+              --status="under_investigation" \
+              > "$VEX_DIR/eclipse-milo.vexctl-example.openvex.json" || true
           else
-            echo "vexctl not available. Skipping OpenVEX validation." | tee "$VEX_DIR/vexctl-validation.log"
+            echo "No vulnerability found for vexctl create example." > "$VEX_DIR/eclipse-milo.vexctl-example.openvex.json"
           fi
 
       - name: Generate traceability manifest
@@ -438,7 +499,10 @@ jobs:
             --arg artifact_quality "$QUALITY_DIR/artifact-sbomqs-score.txt" \
             --arg source_vuln "$VULN_DIR/source-grype.json" \
             --arg artifact_vuln "$VULN_DIR/artifact-grype.json" \
+            --arg vuln_summary "$VULN_DIR/vulnerability-summary.md" \
+            --arg dtrack "$DTRACK_DIR/dependency-track-upload.log" \
             --arg vex "$VEX_DIR/eclipse-milo.openvex.json" \
+            --arg vex_check "$VEX_DIR/openvex-structure-check.log" \
             '{
               repository: $repository,
               ref: $ref,
@@ -465,7 +529,10 @@ jobs:
                 artifact_quality: $artifact_quality,
                 source_vulnerability_results: $source_vuln,
                 artifact_vulnerability_results: $artifact_vuln,
-                vex: $vex
+                vulnerability_summary: $vuln_summary,
+                dependency_track_upload_log: $dtrack,
+                vex: $vex,
+                vex_structure_check: $vex_check
               }
             }' > "$SBOM_DIR/manifest.json"
 
@@ -498,7 +565,8 @@ jobs:
             echo "- Artifact storage: actions/upload-artifact@v4"
             echo "- Vulnerability analysis: Grype"
             echo "- Store, scan and track: Dependency-Track optional upload"
-            echo "- VEX: OpenVEX generated and validated with vexctl where available"
+            echo "- VEX: OpenVEX generated from Grype findings"
+            echo "- VEX tooling: vexctl create example + jq structural check"
             echo "- SBOM standard: CycloneDX"
             echo "- SBOM schema version: 1.6"
             echo "- Output format: JSON"
@@ -551,6 +619,16 @@ jobs:
               done
             else
               echo "- No vulnerability results generated"
+            fi
+            echo
+            echo "## Dependency-Track results"
+            if [ -d "$DTRACK_DIR" ]; then
+              find "$DTRACK_DIR" -type f | sort | while read file; do
+                size=$(wc -c < "$file")
+                echo "- \`$file\` (${size} bytes)"
+              done
+            else
+              echo "- No Dependency-Track results generated"
             fi
             echo
             echo "## VEX results"
