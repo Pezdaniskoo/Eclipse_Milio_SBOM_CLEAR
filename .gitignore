@@ -1,0 +1,26 @@
+cat > .gitignore <<'EOF'
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.save
+
+# SBOM outputs
+sbom/
+sbom-input/
+sbom-input-milo/
+build-logs/
+*.log
+
+# Build outputs
+**/target/
+**/node_modules/
+**/dist/
+**/build/
+
+# Do not keep copied nested GitHub workflows
+source/.github/
+EOF

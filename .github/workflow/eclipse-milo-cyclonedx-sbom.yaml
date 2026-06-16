@@ -1,0 +1,186 @@
+cat > .github/workflows/eclipse-milo-cyclonedx-sbom.yaml <<'EOF'
+name: Eclipse Milo CycloneDX SBOM
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/eclipse-milo-cyclonedx-sbom
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_DIR: source
+
+jobs:
+  milo-cyclonedx-sbom:
+    name: Eclipse Milo CycloneDX SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show repository context
+        run: |
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Ref: $GITHUB_REF"
+          echo "SHA: $GITHUB_SHA"
+          echo "Project directory: $PROJECT_DIR"
+
+          echo
+          echo "Project directory content:"
+          ls -la "$PROJECT_DIR"
+
+          echo
+          echo "Detected Maven files:"
+          find "$PROJECT_DIR" -maxdepth 5 -type f -name "pom.xml" | sort
+
+          echo
+          echo "Maven modules:"
+          grep -n "<module>" "$PROJECT_DIR/pom.xml" || true
+
+      - name: Set up Java 17 for Eclipse Milo build
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Install project tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq unzip zip make rsync
+
+          echo "Java:"
+          java -version
+          javac -version
+
+          echo "Maven:"
+          mvn -version
+
+      - name: Install Syft
+        run: |
+          mkdir -p sbom/milo/source sbom/milo/artifacts build-logs/milo
+
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          syft version
+
+      - name: Set up Node.js 22 for cdxgen
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install cdxgen
+        run: |
+          npm install -g @cyclonedx/cdxgen
+          cdxgen --version
+
+      - name: Generate Syft CycloneDX SBOM from Eclipse Milo source before build
+        run: |
+          mkdir -p sbom/milo/source
+
+          syft dir:"$PROJECT_DIR" \
+            --source-name Eclipse-Milo-Source \
+            --source-version "$GITHUB_SHA" \
+            -o cyclonedx-json=sbom/milo/source/eclipse-milo.source.syft.cyclonedx.json
+
+      - name: Generate cdxgen CycloneDX SBOM from Eclipse Milo source before build
+        run: |
+          mkdir -p sbom/milo/source
+
+          cdxgen "$PROJECT_DIR" \
+            -o sbom/milo/source/eclipse-milo.source.cdxgen.cyclonedx.json \
+            --spec-version 1.6
+
+      - name: Maven build Eclipse Milo
+        run: |
+          mkdir -p build-logs/milo
+
+          cd "$PROJECT_DIR"
+
+          mvn -B -ntp -DskipTests package \
+            2>&1 | tee "$GITHUB_WORKSPACE/build-logs/milo/maven-build.log"
+
+      - name: Collect Eclipse Milo build artifacts after build
+        if: always()
+        run: |
+          mkdir -p build-logs/milo
+          rm -rf sbom-input-milo
+          mkdir -p sbom-input-milo
+
+          find "$PROJECT_DIR" -type f \( \
+            -path "*/target/*.jar" -o \
+            -path "*/target/*.war" -o \
+            -path "*/target/*.zip" \
+          \) \
+            -print -exec cp --parents {} sbom-input-milo/ \; || true
+
+          find sbom-input-milo -type f | sort | tee build-logs/milo/collected-artifacts.txt
+          echo "Collected artifact count:"
+          find sbom-input-milo -type f | wc -l
+
+      - name: Generate Syft CycloneDX SBOM from Eclipse Milo build artifacts
+        run: |
+          mkdir -p sbom/milo/artifacts
+
+          if [ "$(find sbom-input-milo -type f | wc -l)" -gt 0 ]; then
+            syft dir:sbom-input-milo \
+              --source-name Eclipse-Milo-Build-Artifacts \
+              --source-version "$GITHUB_SHA" \
+              -o cyclonedx-json=sbom/milo/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json
+          else
+            echo "No build artifacts found. Skipping artifact-only Syft CycloneDX SBOM."
+          fi
+
+      - name: Generate cdxgen CycloneDX SBOM from Eclipse Milo build artifacts
+        run: |
+          mkdir -p sbom/milo/artifacts
+
+          if [ "$(find sbom-input-milo -type f | wc -l)" -gt 0 ]; then
+            cdxgen sbom-input-milo \
+              -o sbom/milo/artifacts/eclipse-milo.artifacts.cdxgen.cyclonedx.json \
+              --spec-version 1.6 || true
+          else
+            echo "No build artifacts found. Skipping artifact-only cdxgen CycloneDX SBOM."
+          fi
+
+      - name: Generate Eclipse Milo summary
+        if: always()
+        run: |
+          mkdir -p sbom/milo
+
+          {
+            echo "# Eclipse Milo CycloneDX SBOM summary"
+            echo
+            echo "Project directory: $PROJECT_DIR"
+            echo "Commit: $GITHUB_SHA"
+            echo
+            echo "## Scope"
+            echo "- Source CycloneDX SBOM generated before build"
+            echo "- Maven build executed"
+            echo "- Artifact CycloneDX SBOM generated after build"
+            echo
+            echo "## Generated files"
+            find sbom/milo -type f | sort | while read file; do
+              size=$(wc -c < "$file")
+              echo "- \`$file\` (${size} bytes)"
+            done
+          } > sbom/milo/summary.md
+
+          cat sbom/milo/summary.md
+
+      - name: Upload Eclipse Milo CycloneDX SBOM results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eclipse-milo-cyclonedx-sbom-results
+          path: |
+            sbom/milo/
+            build-logs/milo/
+            sbom-input-milo/
+EOF
