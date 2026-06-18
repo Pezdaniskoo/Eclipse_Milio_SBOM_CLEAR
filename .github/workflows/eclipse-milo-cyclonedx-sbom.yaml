@@ -3,8 +3,6 @@ name: Eclipse Milo CycloneDX SBOM
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
   pull_request:
 
 permissions:
@@ -85,7 +83,7 @@ jobs:
       - name: Install base tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq unzip zip make rsync curl wget
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip zip make rsync curl wget maven
 
           mkdir -p \
             "$SBOM_DIR/source" \
@@ -132,11 +130,10 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
           grype version | tee "$BUILD_LOG_DIR/grype-version.txt"
 
-      - name: Install Trivy    
+      - name: Install Trivy
         run: |
           curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           trivy --version | tee "$BUILD_LOG_DIR/trivy-version.txt"
-
 
       - name: Install CycloneDX CLI
         run: |
@@ -174,9 +171,10 @@ jobs:
           "$HOME/.local/bin/depscan" --version | tee "$BUILD_LOG_DIR/depscan-version.txt" || true
           cdxgen --version | tee "$BUILD_LOG_DIR/cdxgen-version-for-depscan.txt" || true
 
-      - name: Install CVE Binary Tool
+      - name: Install CVE Binary Tool from main branch
         run: |
-          python -m pip install --user cve-bin-tool || true
+          python -m pip install --upgrade pip
+          python -m pip install --user --upgrade "git+https://github.com/ossf/cve-bin-tool@main"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
           "$HOME/.local/bin/cve-bin-tool" --version | tee "$BUILD_LOG_DIR/cve-bin-tool-version.txt" || true
@@ -199,6 +197,24 @@ jobs:
           sudo mv "$SBOM_UTILITY_BIN" /usr/local/bin/sbom-utility
 
           sbom-utility version | tee "$BUILD_LOG_DIR/sbom-utility-version.txt" || true
+
+      - name: Cache OWASP Dependency-Check data
+        uses: actions/cache@v4
+        with:
+          path: ~/.dependency-check-data
+          key: dependency-check-data-${{ runner.os }}
+          restore-keys: |
+            dependency-check-data-
+
+      - name: Cache CVE Binary Tool data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/cve-bin-tool
+            ~/.local/share/cve-bin-tool
+          key: cve-bin-tool-data-${{ runner.os }}
+          restore-keys: |
+            cve-bin-tool-data-
 
       - name: Generate source CycloneDX SBOM before build with cyclonedx-maven-plugin
         run: |
@@ -425,6 +441,7 @@ jobs:
               org.owasp:dependency-check-maven:check \
               -Dformat=ALL \
               -DfailBuildOnCVSS=11 \
+              -DdataDirectory="$HOME/.dependency-check-data" \
               -DoutputDirectory="$GITHUB_WORKSPACE/$VULN_DIR/dependency-check" \
               -DnvdApiKey="$NVD_API_KEY" \
               2>&1 | tee "$GITHUB_WORKSPACE/$VULN_DIR/dependency-check/dependency-check.log" || true
@@ -433,30 +450,44 @@ jobs:
               org.owasp:dependency-check-maven:check \
               -Dformat=ALL \
               -DfailBuildOnCVSS=11 \
+              -DdataDirectory="$HOME/.dependency-check-data" \
               -DoutputDirectory="$GITHUB_WORKSPACE/$VULN_DIR/dependency-check" \
               2>&1 | tee "$GITHUB_WORKSPACE/$VULN_DIR/dependency-check/dependency-check.log" || true
           fi
 
       - name: OWASP dep-scan
+        continue-on-error: true
         run: |
           mkdir -p "$VULN_DIR/depscan"
 
+          DEPSCAN_STATUS_FILE="$VULN_DIR/depscan/depscan-status.json"
+
           if command -v depscan >/dev/null 2>&1; then
-            depscan \
-              --src "$PROJECT_DIR" \
-              --type java \
-              --reports-dir "$VULN_DIR/depscan" \
-              --report_file eclipse-milo-depscan \
-              2>&1 | tee "$VULN_DIR/depscan/depscan.log" || true
+            DEPSCAN_CMD="depscan"
           elif [ -x "$HOME/.local/bin/depscan" ]; then
-            "$HOME/.local/bin/depscan" \
-              --src "$PROJECT_DIR" \
-              --type java \
-              --reports-dir "$VULN_DIR/depscan" \
-              --report_file eclipse-milo-depscan \
-              2>&1 | tee "$VULN_DIR/depscan/depscan.log" || true
+            DEPSCAN_CMD="$HOME/.local/bin/depscan"
           else
             echo "depscan command not available. Skipping OWASP dep-scan." | tee "$VULN_DIR/depscan/depscan.log"
+            echo '{"status":"skipped","reason":"depscan command not available"}' > "$DEPSCAN_STATUS_FILE"
+            exit 0
+          fi
+
+          set +e
+          "$DEPSCAN_CMD" \
+            --src "$PROJECT_DIR" \
+            --type java \
+            --reports-dir "$VULN_DIR/depscan" \
+            --report-name eclipse-milo-depscan \
+            --no-vuln-table \
+            2>&1 | tee "$VULN_DIR/depscan/depscan.log"
+          DEPSCAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$DEPSCAN_EXIT" -eq 0 ]; then
+            echo '{"status":"success"}' > "$DEPSCAN_STATUS_FILE"
+          else
+            jq -n --arg status "failed" --arg exit_code "$DEPSCAN_EXIT" --arg reason "OWASP dep-scan exited with non-zero code; see depscan.log" \
+              '{status:$status, exit_code:$exit_code, reason:$reason}' > "$DEPSCAN_STATUS_FILE"
           fi
 
       - name: OSV-Scanner source scan
@@ -473,55 +504,113 @@ jobs:
             -r "$PROJECT_DIR" \
             2>&1 | tee "$VULN_DIR/osv-scanner/osv-source.table.txt" || true
 
-      - name: OSV-Scanner SBOM scan
+      - name: Record OSV-Scanner SBOM mode status
         run: |
           mkdir -p "$VULN_DIR/osv-scanner"
 
-          osv-scanner scan \
-            -L "$SBOM_DIR/source/eclipse-milo.source.cyclonedx.json" \
-            --format json \
-            --output-file "$VULN_DIR/osv-scanner/osv-source-sbom.json" \
-            2>&1 | tee "$VULN_DIR/osv-scanner/osv-source-sbom-json.log" || true
+          {
+            echo "OSV-Scanner SBOM mode was intentionally not used as a primary result in this workflow."
+            echo "Reason: the current tested command did not reliably consume CycloneDX 1.6 JSON SBOM files in this project."
+            echo "Primary OSV result is produced by the OSV-Scanner source scan step."
+          } > "$VULN_DIR/osv-scanner/osv-sbom-mode-status.txt"
 
-          if [ -f "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" ]; then
-            osv-scanner scan \
-              -L "$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json" \
-              --format json \
-              --output-file "$VULN_DIR/osv-scanner/osv-artifact-sbom.json" \
-              2>&1 | tee "$VULN_DIR/osv-scanner/osv-artifact-sbom-json.log" || true
-          fi
+          echo '{"status":"skipped","reason":"SBOM mode not used; source mode is the primary OSV result"}' > "$VULN_DIR/osv-scanner/osv-sbom-mode-status.json"
 
-      - name: CVE Binary Tool scan
+      - name: CVE Binary Tool optimized SBOM scan
+        timeout-minutes: 45
+        continue-on-error: true
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           mkdir -p "$VULN_DIR/cve-bin-tool"
 
-          if command -v cve-bin-tool >/dev/null 2>&1; then
-            cve-bin-tool \
-              --format json \
-              --output-file "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.json" \
-              "$ARTIFACT_INPUT_DIR" \
-              2>&1 | tee "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.log" || true
+          LOG_FILE="$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.log"
+          JSON_FILE="$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.json"
+          CSV_FILE="$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.csv"
+          SBOM_FILE="$SBOM_DIR/artifacts/eclipse-milo.artifacts.syft.cyclonedx.json"
 
-            cve-bin-tool \
-              --format csv \
-              --output-file "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.csv" \
-              "$ARTIFACT_INPUT_DIR" \
-              2>&1 | tee -a "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.log" || true
-          elif [ -x "$HOME/.local/bin/cve-bin-tool" ]; then
-            "$HOME/.local/bin/cve-bin-tool" \
-              --format json \
-              --output-file "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.json" \
-              "$ARTIFACT_INPUT_DIR" \
-              2>&1 | tee "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.log" || true
+          echo "CVE Binary Tool optimized scan started." | tee "$LOG_FILE"
+          echo "Mode: scan CycloneDX artifact SBOM instead of recursively scanning JAR files." | tee -a "$LOG_FILE"
+          echo "Disabled data sources: OSV,GAD,EPSS to reduce update time and avoid unstable external fetches." | tee -a "$LOG_FILE"
+          echo "NVD mode: json-mirror. Cache paths are restored by actions/cache when available." | tee -a "$LOG_FILE"
 
-            "$HOME/.local/bin/cve-bin-tool" \
-              --format csv \
-              --output-file "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.csv" \
-              "$ARTIFACT_INPUT_DIR" \
-              2>&1 | tee -a "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.log" || true
-          else
-            echo "cve-bin-tool command not available. Skipping CVE Binary Tool." | tee "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.log"
+          if [ ! -f "$SBOM_FILE" ]; then
+            echo "Artifact SBOM not found. Skipping CVE Binary Tool scan." | tee -a "$LOG_FILE"
+            echo '{"status":"skipped","reason":"Artifact SBOM not found"}' > "$JSON_FILE"
+            echo "status,reason" > "$CSV_FILE"
+            echo "skipped,Artifact SBOM not found" >> "$CSV_FILE"
+            exit 0
           fi
+
+          if command -v cve-bin-tool >/dev/null 2>&1; then
+            CVE_BIN_TOOL_CMD="cve-bin-tool"
+          elif [ -x "$HOME/.local/bin/cve-bin-tool" ]; then
+            CVE_BIN_TOOL_CMD="$HOME/.local/bin/cve-bin-tool"
+          else
+            echo "cve-bin-tool command not available. Skipping CVE Binary Tool." | tee -a "$LOG_FILE"
+            echo '{"status":"skipped","reason":"cve-bin-tool command not available"}' > "$JSON_FILE"
+            echo "status,reason" > "$CSV_FILE"
+            echo "skipped,cve-bin-tool command not available" >> "$CSV_FILE"
+            exit 0
+          fi
+
+          COMMON_ARGS=(
+            --sbom cyclonedx
+            --sbom-file "$SBOM_FILE"
+            -d "OSV,GAD,EPSS"
+            --nvd json-mirror
+            --update daily
+            --disable-version-check
+          )
+
+          if [ -n "$NVD_API_KEY" ]; then
+            COMMON_ARGS+=(--nvd-api-key "$NVD_API_KEY")
+          fi
+
+          echo "Using command: $CVE_BIN_TOOL_CMD" | tee -a "$LOG_FILE"
+
+          set +e
+
+          timeout 40m "$CVE_BIN_TOOL_CMD" \
+            "${COMMON_ARGS[@]}" \
+            --format json \
+            --output-file "$JSON_FILE" \
+            2>&1 | tee -a "$LOG_FILE"
+
+          JSON_EXIT=${PIPESTATUS[0]}
+          echo "CVE Binary Tool JSON scan exit code: $JSON_EXIT" | tee -a "$LOG_FILE"
+
+          timeout 40m "$CVE_BIN_TOOL_CMD" \
+            "${COMMON_ARGS[@]}" \
+            --format csv \
+            --output-file "$CSV_FILE" \
+            2>&1 | tee -a "$LOG_FILE"
+
+          CSV_EXIT=${PIPESTATUS[0]}
+          echo "CVE Binary Tool CSV scan exit code: $CSV_EXIT" | tee -a "$LOG_FILE"
+
+          set -e
+
+          if [ ! -f "$JSON_FILE" ]; then
+            jq -n \
+              --arg status "incomplete" \
+              --arg reason "CVE Binary Tool did not complete or produced no JSON output. See log for details. This scanner is non-blocking." \
+              --arg json_exit "$JSON_EXIT" \
+              --arg csv_exit "$CSV_EXIT" \
+              '{
+                status: $status,
+                reason: $reason,
+                json_exit_code: $json_exit,
+                csv_exit_code: $csv_exit
+              }' > "$JSON_FILE"
+          fi
+
+          if [ ! -f "$CSV_FILE" ]; then
+            echo "status,reason" > "$CSV_FILE"
+            echo "incomplete,CVE Binary Tool did not complete or produced no CSV output" >> "$CSV_FILE"
+          fi
+
+          echo "CVE Binary Tool optimized SBOM scan completed in non-blocking mode." | tee -a "$LOG_FILE"
 
       - name: sbom-utility additional SBOM analysis
         run: |
@@ -542,8 +631,50 @@ jobs:
         run: |
           mkdir -p "$VULN_DIR"
 
+          status_from_json() {
+            local file="$1"
+            local default_status="$2"
+            if [ -f "$file" ]; then
+              jq -r '.status // empty' "$file" 2>/dev/null | grep -q . && jq -r '.status' "$file" 2>/dev/null || echo "$default_status"
+            else
+              echo "missing"
+            fi
+          }
+
+          exists_status() {
+            local file="$1"
+            if [ -s "$file" ]; then
+              echo "success"
+            else
+              echo "missing"
+            fi
+          }
+
           GRYPE_SOURCE_TOTAL=$(jq '.matches | length' "$VULN_DIR/grype/source-grype.json" 2>/dev/null || echo 0)
           GRYPE_ARTIFACT_TOTAL=$(jq '.matches | length' "$VULN_DIR/grype/artifact-grype.json" 2>/dev/null || echo 0)
+
+          GRYPE_STATUS=$(exists_status "$VULN_DIR/grype/source-grype.json")
+          TRIVY_FS_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-fs.json")
+          TRIVY_SOURCE_SBOM_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-source-sbom.json")
+          TRIVY_ARTIFACT_SBOM_STATUS=$(exists_status "$VULN_DIR/trivy/trivy-artifact-sbom.json")
+          OSV_SOURCE_STATUS=$(exists_status "$VULN_DIR/osv-scanner/osv-source.json")
+          OSV_SBOM_STATUS=$(status_from_json "$VULN_DIR/osv-scanner/osv-sbom-mode-status.json" "skipped")
+          DEPSCAN_STATUS=$(status_from_json "$VULN_DIR/depscan/depscan-status.json" "completed_or_report_generated")
+          CVE_BINARY_TOOL_STATUS=$(status_from_json "$VULN_DIR/cve-bin-tool/cve-bin-tool-artifacts.json" "completed_or_report_generated")
+
+          if ls "$VULN_DIR/dependency-check"/dependency-check-report.* >/dev/null 2>&1; then
+            DEPENDENCY_CHECK_STATUS="success"
+          elif grep -qi "BUILD FAILURE\|UpdateException\|NoDataException\|NVD Returned Status Code" "$VULN_DIR/dependency-check/dependency-check.log" 2>/dev/null; then
+            DEPENDENCY_CHECK_STATUS="failed"
+          else
+            DEPENDENCY_CHECK_STATUS="unknown_or_log_only"
+          fi
+
+          if [ -f "$VULN_DIR/github-dependency-review/dependency-review-status.txt" ]; then
+            GITHUB_DEP_REVIEW_STATUS=$(cat "$VULN_DIR/github-dependency-review/dependency-review-status.txt" | head -n 1)
+          else
+            GITHUB_DEP_REVIEW_STATUS="missing"
+          fi
 
           {
             echo "# Eclipse Milo vulnerability analysis summary"
@@ -551,21 +682,21 @@ jobs:
             echo "Repository: $GITHUB_REPOSITORY"
             echo "Commit: $GITHUB_SHA"
             echo
-            echo "## Implemented vulnerability and SBOM analysis tools"
+            echo "## Tool status"
             echo
-            echo "- Grype"
-            echo "- Trivy"
-            echo "- OWASP Dependency-Check"
-            echo "- GitHub Dependency Review"
-            echo "- OWASP dep-scan"
-            echo "- OSV-Scanner"
-            echo "- CVE Binary Tool"
-            echo "- sbom-utility"
-            echo
-            echo "## Grype counts"
-            echo
-            echo "- Source SBOM findings: $GRYPE_SOURCE_TOTAL"
-            echo "- Artifact SBOM findings: $GRYPE_ARTIFACT_TOTAL"
+            echo "| Tool | Status | Notes |"
+            echo "|---|---|---|"
+            echo "| Grype | $GRYPE_STATUS | Source findings: $GRYPE_SOURCE_TOTAL, artifact findings: $GRYPE_ARTIFACT_TOTAL |"
+            echo "| Trivy filesystem scan | $TRIVY_FS_STATUS | Broader/noisier scan of source tree |"
+            echo "| Trivy source SBOM scan | $TRIVY_SOURCE_SBOM_STATUS | Comparable with Grype source SBOM scan |"
+            echo "| Trivy artifact SBOM scan | $TRIVY_ARTIFACT_SBOM_STATUS | Comparable with Grype artifact SBOM scan |"
+            echo "| OWASP Dependency-Check | $DEPENDENCY_CHECK_STATUS | Requires stable NVD access; NVD_API_KEY recommended |"
+            echo "| GitHub Dependency Review | $GITHUB_DEP_REVIEW_STATUS | Runs only on pull_request events |"
+            echo "| OWASP dep-scan | $DEPSCAN_STATUS | Uses corrected --report-name argument |"
+            echo "| OSV-Scanner source mode | $OSV_SOURCE_STATUS | Primary OSV result |"
+            echo "| OSV-Scanner SBOM mode | $OSV_SBOM_STATUS | Not used as primary result for CycloneDX 1.6 in this workflow |"
+            echo "| CVE Binary Tool | $CVE_BINARY_TOOL_STATUS | Installed from main branch; optimized SBOM mode; OSV/GAD/EPSS disabled; non-blocking |"
+            echo "| sbom-utility | success_if_validation_files_exist | SBOM validation/inspection, not primary vulnerability scanner |"
             echo
             echo "## Tool output directories"
             echo
@@ -580,10 +711,10 @@ jobs:
             echo
             echo "## Notes"
             echo
-            echo "- Scanners are configured in report-only mode so that vulnerability findings do not break the SBOM lifecycle demonstration pipeline."
-            echo "- GitHub Dependency Review runs only on pull_request events."
-            echo "- Dependency-Check can be slow without NVD_API_KEY secret."
-            echo "- CVE Binary Tool is included for coverage of the requested tool matrix, but for Java/Maven dependencies Grype, Trivy, OSV-Scanner and Dependency-Check are usually more relevant."
+            echo "- Build and SBOM validation are treated as core lifecycle checks."
+            echo "- Vulnerability scanners run in report-only/non-blocking mode where external databases may be unstable."
+            echo "- Dependency-Track upload is conditional on secrets being configured."
+            echo "- VEX output is an under_investigation placeholder and does not claim affected/not_affected status."
           } > "$VULN_DIR/vulnerability-summary.md"
 
           cat "$VULN_DIR/vulnerability-summary.md"
